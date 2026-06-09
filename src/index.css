@@ -1,0 +1,36 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&family=Manrope:wght@400;600;700&display=swap');
+
+:root {
+  --display-font: 'Space Grotesk', 'Segoe UI', sans-serif;
+  --body-font: 'Manrope', 'Segoe UI', sans-serif;
+  --mono-font: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+
+  --ink-0: #f4f7fd;
+  --ink-1: #dfebff;
+  --ink-2: #b0c2dc;
+  --ink-3: #9eb2ce;
+
+  --accent-cool: #62c6ff;
+  --accent-warm: #ff8a5b;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  font-family: var(--body-font);
+  color: var(--ink-0);
+}
+
+#root {
+  min-height: 100vh;
+}
