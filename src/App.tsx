@@ -1,14 +1,7 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import './App.css'
 
 type SiteCode = 'FRE' | 'AUS' | 'REN'
-
-type SiteConfig = {
-  name: string
-  avgCommuteSpeedMph: number
-  parkingBufferMinutes: number
-  chargerDensity: 'High' | 'Medium' | 'Low'
-}
 
 type PlanResult = {
   leaveBy: string
@@ -19,28 +12,29 @@ type PlanResult = {
   routeSummary: string
 }
 
-const sites: Record<SiteCode, SiteConfig> = {
-  FRE: {
-    name: 'Fremont Factory',
-    avgCommuteSpeedMph: 33,
-    parkingBufferMinutes: 14,
-    chargerDensity: 'High',
-  },
-  AUS: {
-    name: 'Austin Gigafactory',
-    avgCommuteSpeedMph: 42,
-    parkingBufferMinutes: 11,
-    chargerDensity: 'Medium',
-  },
-  REN: {
-    name: 'Reno Gigafactory',
-    avgCommuteSpeedMph: 48,
-    parkingBufferMinutes: 9,
-    chargerDensity: 'Low',
-  },
+type PolicySnippet = {
+  id: string
+  title: string
+  text: string
+  citation?: {
+    policyCode: string
+    chunkIndex: number
+    score: number
+  }
 }
 
-const policySnippets = [
+type AdminMetrics = {
+  siteRisk: Array<{ site: string; value: number }>
+  kpis: {
+    failedToolCallsPercent: number
+    medianMcpLatencyMs: number
+    policyDeflectionRatePercent: number
+  }
+}
+
+const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || ''
+
+const fallbackPolicies: PolicySnippet[] = [
   {
     id: 'PO-13.4',
     title: 'Shift Arrival and Attendance',
@@ -58,7 +52,7 @@ const policySnippets = [
   },
 ]
 
-const mcpTools = [
+const fallbackTools = [
   'get_employee_profile(employee_id)',
   'get_shift_schedule(employee_id)',
   'get_vehicle_status(user_id)',
@@ -68,14 +62,6 @@ const mcpTools = [
   'submit_parking_request(employee_id, site_id)',
 ]
 
-function toClockLabel(d: Date) {
-  return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
-}
-
-function clampScore(value: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, value))
-}
-
 function App() {
   const [site, setSite] = useState<SiteCode>('FRE')
   const [shiftTime, setShiftTime] = useState('07:00')
@@ -83,61 +69,175 @@ function App() {
   const [batteryPercent, setBatteryPercent] = useState(42)
   const [trafficMultiplier, setTrafficMultiplier] = useState(1.25)
   const [policyQuery, setPolicyQuery] = useState('Can I expense a charging stop on my way to shift?')
+  const [plan, setPlan] = useState<PlanResult | null>(null)
+  const [planStatus, setPlanStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
+  const [policyResults, setPolicyResults] = useState<PolicySnippet[]>(fallbackPolicies)
+  const [policyGroundedAnswer, setPolicyGroundedAnswer] = useState('')
+  const [policyStatus, setPolicyStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
+  const [tools, setTools] = useState<string[]>(fallbackTools)
+  const [metrics, setMetrics] = useState<AdminMetrics | null>(null)
+  const [apiWarning, setApiWarning] = useState('')
 
-  const plan = useMemo<PlanResult>(() => {
-    const selectedSite = sites[site]
-    const commuteMinutes = (distanceMiles / selectedSite.avgCommuteSpeedMph) * 60 * trafficMultiplier
-    const routeEnergyUse = distanceMiles * 0.35
-    const reserveTarget = site === 'REN' ? 20 : 16
-    const needsChargeStop = batteryPercent - routeEnergyUse < reserveTarget
-    const chargeGain = needsChargeStop ? 24 : 0
-    const arrivalBattery = clampScore(Math.round(batteryPercent - routeEnergyUse + chargeGain), 3, 100)
+  useEffect(() => {
+    let active = true
 
-    const [hourString, minuteString] = shiftTime.split(':')
-    const shiftDate = new Date()
-    shiftDate.setHours(Number(hourString), Number(minuteString), 0, 0)
+    async function fetchPlan() {
+      setPlanStatus('loading')
+      try {
+        const response = await fetch(`${apiBaseUrl}/api/commute-plan`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            site,
+            shiftTime,
+            distanceMiles,
+            batteryPercent,
+            trafficMultiplier,
+          }),
+        })
 
-    const leaveDate = new Date(
-      shiftDate.getTime() - (commuteMinutes + selectedSite.parkingBufferMinutes) * 60_000,
-    )
+        if (!response.ok) {
+          throw new Error('Backend response was not ok')
+        }
 
-    const weatherPenalty = trafficMultiplier > 1.3 ? 12 : 5
-    const lowBatteryPenalty = batteryPercent < 35 ? 18 : 7
-    const parkingPenalty = selectedSite.parkingBufferMinutes > 12 ? 14 : 8
-    const riskScore = clampScore(
-      Math.round((weatherPenalty + lowBatteryPenalty + parkingPenalty + distanceMiles / 3) / 1.5),
-      8,
-      100,
-    )
+        const payload = (await response.json()) as { plan: PlanResult }
+        if (active) {
+          setPlan(payload.plan)
+          setPlanStatus('ready')
+          setApiWarning('')
+        }
+      } catch {
+        if (active) {
+          setPlanStatus('error')
+          setApiWarning('Backend unavailable. Showing fallback data for some sections.')
+        }
+      }
+    }
 
-    const chargingStop = needsChargeStop
-      ? `${selectedSite.name} corridor Supercharger (12 min top-up)`
-      : 'No stop required; direct route recommended'
+    fetchPlan()
 
-    const parkingRecommendation =
-      selectedSite.parkingBufferMinutes > 12
-        ? 'South Lot B - leave 4 min walk buffer'
-        : 'Main Employee Deck - standard entry flow'
-
-    const routeSummary = `~${Math.round(commuteMinutes)} min drive, ${selectedSite.chargerDensity.toLowerCase()} charger density, traffic factor ${trafficMultiplier.toFixed(2)}x`
-
-    return {
-      leaveBy: toClockLabel(leaveDate),
-      arrivalBattery,
-      chargingStop,
-      riskScore,
-      parkingRecommendation,
-      routeSummary,
+    return () => {
+      active = false
     }
   }, [batteryPercent, distanceMiles, shiftTime, site, trafficMultiplier])
 
-  const matchedPolicies = useMemo(() => {
-    const query = policyQuery.toLowerCase()
-    return policySnippets.filter((item) => {
-      const haystack = `${item.title} ${item.text}`.toLowerCase()
-      return query.split(' ').some((token) => token.length > 3 && haystack.includes(token))
-    })
+  useEffect(() => {
+    let active = true
+    const controller = new AbortController()
+
+    const timer = setTimeout(async () => {
+      setPolicyStatus('loading')
+      try {
+        const response = await fetch(`${apiBaseUrl}/api/policy-search`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({ query: policyQuery }),
+        })
+
+        if (!response.ok) {
+          throw new Error('Policy search failed')
+        }
+
+        const payload = (await response.json()) as {
+          groundedAnswer: string
+          results: PolicySnippet[]
+        }
+        if (active) {
+          setPolicyResults(payload.results)
+          setPolicyGroundedAnswer(payload.groundedAnswer)
+          setPolicyStatus('ready')
+        }
+      } catch {
+        if (active) {
+          setPolicyResults(fallbackPolicies)
+          setPolicyGroundedAnswer('')
+          setPolicyStatus('error')
+        }
+      }
+    }, 250)
+
+    return () => {
+      active = false
+      controller.abort()
+      clearTimeout(timer)
+    }
   }, [policyQuery])
+
+  useEffect(() => {
+    let active = true
+
+    async function fetchMetadata() {
+      try {
+        const [toolResponse, metricsResponse] = await Promise.all([
+          fetch(`${apiBaseUrl}/api/mcp-tools`),
+          fetch(`${apiBaseUrl}/api/admin-metrics`),
+        ])
+
+        if (!toolResponse.ok || !metricsResponse.ok) {
+          throw new Error('Metadata fetch failed')
+        }
+
+        const toolPayload = (await toolResponse.json()) as { tools: string[] }
+        const metricsPayload = (await metricsResponse.json()) as AdminMetrics
+
+        if (active) {
+          setTools(toolPayload.tools)
+          setMetrics(metricsPayload)
+        }
+      } catch {
+        if (active) {
+          setMetrics({
+            siteRisk: [
+              { site: 'Fremont Risk', value: 72 },
+              { site: 'Austin Risk', value: 51 },
+              { site: 'Reno Risk', value: 63 },
+            ],
+            kpis: {
+              failedToolCallsPercent: 2.4,
+              medianMcpLatencyMs: 220,
+              policyDeflectionRatePercent: 68,
+            },
+          })
+        }
+      }
+    }
+
+    fetchMetadata()
+
+    return () => {
+      active = false
+    }
+  }, [])
+
+  const resolvedPlan = useMemo(() => {
+    if (plan) {
+      return plan
+    }
+
+    return {
+      leaveBy: '--:--',
+      arrivalBattery: 0,
+      chargingStop: 'Start backend to generate plan',
+      riskScore: 0,
+      parkingRecommendation: 'Not available',
+      routeSummary: 'Waiting for backend response',
+    }
+  }, [plan])
+
+  const resolvedMetrics =
+    metrics || {
+      siteRisk: [
+        { site: 'Fremont Risk', value: 72 },
+        { site: 'Austin Risk', value: 51 },
+        { site: 'Reno Risk', value: 63 },
+      ],
+      kpis: {
+        failedToolCallsPercent: 2.4,
+        medianMcpLatencyMs: 220,
+        policyDeflectionRatePercent: 68,
+      },
+    }
 
   return (
     <main className="page-shell">
@@ -148,6 +248,7 @@ function App() {
         <p className="hero-subtitle">
           Plan shift arrival, battery safety, parking, and policy guidance from one internal dashboard.
         </p>
+        {apiWarning ? <p className="status-badge warning">{apiWarning}</p> : null}
       </section>
 
       <section className="layout-grid">
@@ -212,31 +313,32 @@ function App() {
           <div className="result-grid">
             <div className="metric-card">
               <span>Leave By</span>
-              <strong>{plan.leaveBy}</strong>
+              <strong>{resolvedPlan.leaveBy}</strong>
             </div>
             <div className="metric-card">
               <span>Arrival Battery</span>
-              <strong>{plan.arrivalBattery}%</strong>
+              <strong>{resolvedPlan.arrivalBattery}%</strong>
             </div>
             <div className="metric-card wide">
               <span>Charging Plan</span>
-              <strong>{plan.chargingStop}</strong>
+              <strong>{resolvedPlan.chargingStop}</strong>
             </div>
             <div className="metric-card wide">
               <span>Parking Recommendation</span>
-              <strong>{plan.parkingRecommendation}</strong>
+              <strong>{resolvedPlan.parkingRecommendation}</strong>
             </div>
             <div className="metric-card wide">
               <span>Route Summary</span>
-              <strong>{plan.routeSummary}</strong>
+              <strong>{resolvedPlan.routeSummary}</strong>
             </div>
           </div>
+          <p className="status-badge">Planner status: {planStatus}</p>
         </article>
 
         <article className="panel risk-panel">
           <h2>Shift Arrival Risk</h2>
-          <div className="risk-gauge" style={{ ['--risk' as string]: `${plan.riskScore}` }}>
-            <span>{plan.riskScore}</span>
+          <div className="risk-gauge" style={{ ['--risk' as string]: `${resolvedPlan.riskScore}` }}>
+            <span>{resolvedPlan.riskScore}</span>
             <p>Composite risk score</p>
           </div>
 
@@ -248,7 +350,7 @@ function App() {
 
           <h3>MCP Tool Surface</h3>
           <div className="tool-list">
-            {mcpTools.map((tool) => (
+            {tools.map((tool) => (
               <code key={tool}>{tool}</code>
             ))}
           </div>
@@ -265,14 +367,28 @@ function App() {
             onChange={(event) => setPolicyQuery(event.target.value)}
             rows={4}
           />
+          <p className="status-badge">Policy status: {policyStatus}</p>
+
+          {policyGroundedAnswer ? (
+            <div className="policy-answer">
+              <p className="policy-id">GROUNDED ANSWER</p>
+              <p>{policyGroundedAnswer}</p>
+            </div>
+          ) : null}
 
           <div className="policy-results">
-            {matchedPolicies.length > 0 ? (
-              matchedPolicies.map((item) => (
+            {policyResults.length > 0 ? (
+              policyResults.map((item) => (
                 <div key={item.id} className="policy-card">
                   <p className="policy-id">{item.id}</p>
                   <h3>{item.title}</h3>
                   <p>{item.text}</p>
+                  {item.citation ? (
+                    <p className="policy-citation">
+                      Citation: {item.citation.policyCode} chunk {item.citation.chunkIndex} | score{' '}
+                      {item.citation.score}
+                    </p>
+                  ) : null}
                 </div>
               ))
             ) : (
@@ -290,38 +406,28 @@ function App() {
           <p className="panel-subtitle">Mock telemetry for unresolved requests and commute risk by site.</p>
 
           <div className="bars">
-            <div className="bar-item">
-              <span>Fremont Risk</span>
-              <div className="bar-track">
-                <div className="bar-fill" style={{ width: '72%' }} />
+            {resolvedMetrics.siteRisk.map((risk) => (
+              <div key={risk.site} className="bar-item">
+                <span>{risk.site}</span>
+                <div className="bar-track">
+                  <div className="bar-fill" style={{ width: `${risk.value}%` }} />
+                </div>
               </div>
-            </div>
-            <div className="bar-item">
-              <span>Austin Risk</span>
-              <div className="bar-track">
-                <div className="bar-fill" style={{ width: '51%' }} />
-              </div>
-            </div>
-            <div className="bar-item">
-              <span>Reno Risk</span>
-              <div className="bar-track">
-                <div className="bar-fill" style={{ width: '63%' }} />
-              </div>
-            </div>
+            ))}
           </div>
 
           <div className="kpi-row">
             <div>
               <p>Failed Tool Calls</p>
-              <strong>2.4%</strong>
+              <strong>{resolvedMetrics.kpis.failedToolCallsPercent}%</strong>
             </div>
             <div>
               <p>Median MCP Latency</p>
-              <strong>220 ms</strong>
+              <strong>{resolvedMetrics.kpis.medianMcpLatencyMs} ms</strong>
             </div>
             <div>
               <p>Policy Deflection Rate</p>
-              <strong>68%</strong>
+              <strong>{resolvedMetrics.kpis.policyDeflectionRatePercent}%</strong>
             </div>
           </div>
         </article>
